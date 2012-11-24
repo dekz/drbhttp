@@ -3,6 +3,7 @@ require 'base64'
 require 'stringio'
 require 'uri'
 require 'net/http'
+$drb_debug = false
 
 module DRb
   class DRbHTTP < DRbTCPSocket
@@ -11,16 +12,22 @@ module DRb
       super(uri, soc, config)
     end
 
+    def accept
+      log "accept"
+      while true
+        s = @socket.accept
+        break if (@acl ? @acl.allow_socket?(s) : true)
+        s.close
+      end
+      self.class.new(@uri, s, @config)
+    end
+
     def self.open_server(uri, config)
       require 'webrick'
       host, port = parse_uri(uri)
-      @ws = WEBrick::HTTPServer::new(:Port => port)
-      soc = nil
-      soc = @ws.instance_eval do
-        @listeners[0]
-      end
+      soc = TCPServer.open(host, port)
       config[:tcp_port] = port
-      config[:web_server] = @ws
+      #config[:web_server] = @ws
       uri = "drbhttp://#{host}:#{port}"
       self.new(uri, soc, config)
     end
@@ -35,16 +42,13 @@ module DRb
 
     def self.new_request(host, port)
       uri = URI("http://#{host}:#{port}")
-      http = Net::HTTP.start(uri.host, uri.port)
+      #http = Net::HTTP.start(uri.host, uri.port)
+      http = Net::HTTP.new(host, port)
       soc = nil
       soc = http.instance_eval do
         @socket
       end
       return [http, soc]
-    end
-
-    def close
-      super
     end
 
     def self.parse_uri(uri)
@@ -66,20 +70,27 @@ module DRb
     end
 
     def send_request(ref, msg_id, arg, b)
+     log 'send_req'
       io = StringIO.new
       @msg.send_request(io, ref, msg_id, arg, b)
       io.rewind
       msg = io.read
+      log({ :marshal_dump => msg })
       enc_msg = Base64.strict_encode64(msg)
+      log({ :enc_msg => enc_msg })
 
       host, port = self.class.parse_uri(@uri)
-      http, soc = self.class.new_request(host, port)
-      @socket = soc
-      @resp = http.request_post '/', enc_msg
+
+      http = Net::HTTP.new(host, port)
+      post = Net::HTTP::Post.new('/')
+      post.body = enc_msg
+      @resp = http.request post
     end
 
     def recv_reply
+     log 'recv_reply'
       msg = Base64.strict_decode64(@resp.body)
+      log msg
       @resp = nil
       io = StringIO.new
       io.write msg
@@ -88,36 +99,65 @@ module DRb
     end
 
     def send_reply(succ, result)
-      res = WEBrick::HTTPResponse.new @config[:web_server].config
+     log 'send_reply'
+    #begin
+      res = WEBrick::HTTPResponse.new http_config
+    #rescue Exception => e
+    #  puts e
+    #  puts e.backtrace
+    #end
       io = StringIO.new
       @msg.send_reply(io, succ, result)
       io.rewind
       result = io.read
+      log result
       result = Base64.strict_encode64 result
       res.body = result
-      p result
+      #log res
+      #log result
       res.send_response(@socket)
     end
 
     def recv_request
-      req = WEBrick::HTTPRequest.new @config[:web_server].config
-      req.parse(@socket)
-      msg = Base64.strict_decode64(req.body)
+     log 'recv_request'
+      body = ''
+      #begin
+        req = WEBrick::HTTPRequest.new http_config
+        req.parse(@socket)
+        body = req.body
+     # rescue Exception => e
+     #   puts e
+     #   puts e.backtrace
+     #   raise e
+     # end
+      msg = Base64.strict_decode64(body) rescue ''
+      return msg if msg.empty?
+      log msg
       io = StringIO.new
       io.write msg
       io.rewind
       z = @msg.recv_request io
-      p z
       z
     end
 
-    def close
-      puts 'close'
+    def log *args
+      puts"#{caller[0]}: #{args}" if $drb_debug
     end
 
-    def alive?
-      false
+    def http_config
+      host, port = self.class.parse_uri(uri)
+      WEBrick::Config::General.merge({
+        :Port => port,
+        :BindAddress => host,
+        :Logger => WEBrick::Log::new,
+        :InputBufferSize => 1024,
+        :HTTPVersion => "1.1",
+      })
     end
+
+#    def alive?
+#      false
+#    end
 
   end
   DRbProtocol.add_protocol(DRbHTTP)
